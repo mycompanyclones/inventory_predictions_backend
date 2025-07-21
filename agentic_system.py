@@ -11,6 +11,8 @@ import redis
 import json
 import pickle
 from dotenv import load_dotenv
+from flask_socketio import emit
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -738,8 +740,8 @@ class Orchestrator:
         try:
             start_time = time.time()
             # Import required modules for real-time emissions
-            from flask_socketio import emit
-            from datetime import datetime
+            # from flask_socketio import emit
+            # from datetime import datetime
             
             # # Emit processing start
             # try:
@@ -966,7 +968,6 @@ class Orchestrator:
                 - calculate_optimal_inventory_levels: Calculate EOQ, reorder points, and optimal stock levels
                 - analyze_financial_impact: Financial impact analysis including ROI, carrying costs, and revenue impact
                 
-                User query: {user_query}
                 
                 Rules:
                 1. If no data loaded, start with csv_reader
@@ -977,11 +978,20 @@ class Orchestrator:
                 6. Use analyze_supplier_performance for supplier evaluation
                 7. Use calculate_optimal_inventory_levels for inventory optimization
                 8. Use analyze_financial_impact for financial analysis
-                9. If analysis is complete and no more tools needed, don't call any function
+                9. If analysis is complete and no more tools needed, don't call any function.
+                10. Try to use not more than 2 tools at a time and if required use the following tools when this method is getting called recursively.
+                11. Analyze the message object and check if there is any tool call in the message object, and user query and try to evaluate if there is need of calling some other tools well.
+                12. CRITICAL: Even when calling tools, always provide comprehensive reasoning in your response content explaining:
+                    - Why you're choosing these specific tools
+                    - What you plan to analyze with each tool
+                    - How the tools will help answer the user's question
+                    - What insights you expect to generate
+                    - Your analytical approach and methodology
+                13. Never provide empty or minimal content when tool calls are made - always include detailed thought process
                 
                 Analyze the query and context, then call the appropriate tool(s) or no tools if analysis is complete.
                 
-                At last once you think there is no tool is required, please follow the below rules to generate the final response
+                Atlast once you think there is no tool is required, please follow the below rules to generate the final response
                 
                 1. Use clear markdown formatting with headers, tables, bullet points
                 2. Present data in beautiful tables where appropriate
@@ -1001,9 +1011,41 @@ class Orchestrator:
                 - Use > blockquotes for key insights
                 - Use code blocks ``` for data/calculations
                 
-                Note: Provide a brief chain of thought process before calling the tool. Also if tool is picked then provide content as well."""
+                Chart Generation Guidelines:
+                - ALWAYS create data visualizations when presenting analysis results (unless it's a basic clarification question)
+                - Proactively generate charts for ANY data analysis, comparison, or quantitative information
+                - Bar charts: ```chart:bar followed by data in format "Product A: 100" or "Product A | 100"
+                - Line charts: ```chart:line for trend data
+                - Pie charts: ```chart:pie for percentage distributions
+                - Always include a descriptive title: "title: Chart Title" as first line
+                - Example bar chart:
+                  ```chart:bar
+                  title: Inventory Levels by Product
+                  Product A: 150
+                  Product B: 200
+                  Product C: 75
+                  ```
+                - Example pie chart:
+                  ```chart:pie
+                  title: Risk Distribution
+                  High Risk: 30
+                  Medium Risk: 45
+                  Low Risk: 25
+                  ```
+                - MANDATORY: Generate charts for inventory levels, demand forecasts, risk distributions, financial comparisons, supplier performance, trends over time, cost analysis, ROI calculations, performance metrics
+                - Even for follow-up questions, if they involve data or comparisons, create a chart
+                - Only skip charts for simple clarification questions like "What does ROI mean?" or "How do you calculate this?"
                 
-                print(f"🤖 Calling OpenAI for tool selection...")
+                Note: ALWAYS provide a comprehensive chain of thought process. When calling tools, explain your analytical reasoning in detail:
+                - Break down the user's question and identify what data/analysis is needed
+                - Explain why you're selecting specific tools and how they'll help
+                - Describe your analytical approach and methodology
+                - Share what insights you expect to discover
+                - Maintain an engaging, explanatory tone that helps users understand your reasoning process
+                - Treat this as educating the user about supply chain analysis while you work
+                Here is the user query: \n{user_query}"""
+                
+                # print(f"🤖 Calling OpenAI for tool selection...")
                 # print(f"📋 History -->>  \n\n {session_history}")
                 
                 try:
@@ -1012,14 +1054,14 @@ class Orchestrator:
                     # Call OpenAI with function calling (with timeout)
                     # print(f"📋 History -->>  \n\n {session_history}")
                     response = client.chat.completions.create(
-                        model="o3-mini",
+                        model="gpt-4o",
                         # messages=[
                         #     {"role": "system", "content": system_message},
                         #     {"role": "user", "content": user_query}
                         # ],
                         messages=session_history,
-                        # tools=tool_definitions,  # type: ignore
-                        # tool_choice="auto",
+                        tools=tool_definitions,  # type: ignore
+                        tool_choice="auto",
                         # temperature=0.2,
                         # timeout=30  # 30 second timeout
                     )
@@ -1038,35 +1080,65 @@ class Orchestrator:
                     # })
                     break
                 
-                # Check if tools were called
-                thought_process_content = response.choices[0].message.content
-                thought_process_object = {
-                    "role": "assistant",
-                    "content": thought_process_content
-                }
-                session_history.append(thought_process_object)
-                print("Response -->>  ", response)
-                print("🤖 Thought process -->>  ", thought_process_content, end="\n\n", flush=True)
-                tool_calls = response.choices[0].message.tool_calls
+                # Extract response components for gpt-4o
+                message = response.choices[0].message
+                thought_process_content = message.content
+                tool_calls = message.tool_calls
                 
-                if not tool_calls:
+                # print("Response -->>  ", response)
+                
+                # Handle gpt-4o response format
+                if tool_calls:
+                    # For gpt-4o: Create assistant message with both content and tool_calls
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": thought_process_content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": tc.type,
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments
+                                }
+                            } for tc in tool_calls
+                        ]
+                    }
+                    session_history.append(assistant_message)
+                    
+                    # Emit thought process for streaming token by token
+                    if thought_process_content:
+                        print("🤖 Starting token-by-token streaming for thought process...")
+                        stream_content_token_by_token(
+                            content=thought_process_content,
+                            event_name='thought_process_stream',
+                            session_id=session_id,
+                            delay=0.02  # 20ms delay between tokens for faster streaming
+                        )
+                    
+                    print("🤖 Thought process -->>  ", thought_process_content or "[Tool calls requested]", end="\n\n", flush=True)
+                    # print(f"🔧 {len(tool_calls)} tool(s) to execute: {[tc.function.name for tc in tool_calls]}")
+                else:
+                    # No tool calls - this is the final response
                     print("✅ No more tools needed - analysis complete")
-                    # emit('synthesis_progress', {
-                    #     'session_id': session_id,
-                    #     'message': "Tool analysis complete, no more tools needed",
-                    #     'timestamp': datetime.now().isoformat()
-                    # })
-                    final_response = response.choices[0].message.content
                     final_response_object = {
                         "role": "assistant",
-                        "content": final_response
+                        "content": thought_process_content
                     }
                     session_history.append(final_response_object)
-                    print("🤖 Final response -->>  ", final_response_object.get("content", "Final response"), end="\n\n", flush=True)
+                    
+                    # Emit final response for streaming token by token
+                    if thought_process_content:
+                        print("✅ Starting token-by-token streaming for final response...")
+                        stream_content_token_by_token(
+                            content=thought_process_content,
+                            event_name='final_response_stream',
+                            session_id=session_id,
+                            delay=0.015  # 15ms delay for final response (slightly faster)
+                        )
+                    
+                    print("🤖 Final response -->>  ", thought_process_content or "Analysis complete", end="\n\n", flush=True)
                     return final_response_object
-                    # break
-                
-                print(f"🔧 {len(tool_calls)} tool(s) to execute: {[tc.function.name for tc in tool_calls]}")
                 
                 # Execute each tool call
                 for tool_call in tool_calls:
@@ -1077,6 +1149,18 @@ class Orchestrator:
                         tool_params = {}
                     
                     print(f"🔧 Executing tool: {tool_name} with params: {tool_params}")
+                    
+                    # Emit tool execution for streaming
+                    try:
+                        emit('tool_execution', {
+                            'session_id': session_id,
+                            'content': f"🔧 Executing tool: {tool_name} with params: {tool_params}",
+                            'tool_name': tool_name,
+                            'params': tool_params,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                    except Exception as e:
+                        print(f"⚠️ Failed to emit tool execution: {e}")
                     
                     # Emit tool start in real-time
                     # emit('tool_start', {
@@ -1093,7 +1177,7 @@ class Orchestrator:
                         "role": "assistant",
                         "content": f"Executing {tool_name} with parameters: {tool_params}"
                     }
-                    session_history.append(tool_action_message)
+                    # session_history.append(tool_action_message)
                     
                     # Execute the tool
                     try:
@@ -1235,10 +1319,11 @@ class Orchestrator:
                         #     'status': 'completed'
                         # })
                         
-                        # Add tool result to history
+                        # Add tool result to history (gpt-4o format)
                         tool_result_message = {
-                            "role": "system",
-                            "content": f"Tool {tool_name} completed successfully. Result: {json.dumps(tool_result, default=str)}"
+                            "role": "tool",
+                            "content": json.dumps(tool_result, default=str),
+                            "tool_call_id": tool_call.id
                         }
                         session_history.append(tool_result_message)
                         
@@ -1247,17 +1332,12 @@ class Orchestrator:
                         import traceback
                         print(f"🔍 [TRACEBACK] Tool execution error: {traceback.format_exc()}")
                         error_result = {"error": f"Tool {tool_name} failed: {str(e)}"}
-                        # all_tool_results.append({
-                        #     "tool_name": tool_name,
-                        #     "parameters": tool_params,
-                        #     "result": error_result,
-                        #     "iteration": iteration_count
-                        # })
                         
-                        # Add error to history
+                        # Add error to history (gpt-4o format)
                         error_message = {
-                            "role": "system", 
-                            "content": f"Tool {tool_name} failed with error: {str(e)}"
+                            "role": "tool",
+                            "content": json.dumps(error_result, default=str),
+                            "tool_call_id": tool_call.id
                         }
                         session_history.append(error_message)
             
@@ -1265,7 +1345,7 @@ class Orchestrator:
 
 
 
-            print(f"Making a recursive call with session history object -->>  \n\n {session_history}")
+            print(f"Making a recursive call with session history object -->> ")
             print("\n\n\n\n\n\n\n")
             final_resp = cls.decide_tools_and_generate_insights(user_query, session_history, session_id, system)
             
@@ -1551,7 +1631,7 @@ class AgenticSystem:
             # Step 2: Tool selection
             pbar.set_description("Selecting analysis tools")
             time.sleep(0.8)
-            tool_call = Orchestrator.decide_tools(user_query)
+            tool_call = Orchestrator.decide_tools_and_generate_insights(user_query, [], self.session.session_id, self.context)
             pbar.update(1)
         
             # Step 3: Data filtering and analysis
@@ -1604,7 +1684,7 @@ class AgenticSystem:
         print("\n✅ Analysis complete!")
         
         # Generate insights with enhanced message history and analysis context
-        result = Orchestrator.generate_insights(
+        result = Orchestrator.decide_tools_and_generate_insights(
             self.session.session_id,
             user_query,
             self.context.get('analysis', {})
@@ -1827,6 +1907,38 @@ def process_flask_query(session_id, user_query, data_path="supply_chain_data.csv
 #         else:
 #             print("No session data found in Redis")
 
-query  = input("Ask a question here: ")
+# query  = input("Ask a question here: ")
 
-print(Orchestrator.decide_tools_and_generate_insights(query, [], "123", {}))
+# print(Orchestrator.decide_tools_and_generate_insights(query, [], "123", {}))
+
+def stream_content_token_by_token(content: str, event_name: str, session_id: str, delay: float = 0.03):
+    """
+    Stream content token by token with configurable delay
+    """
+    if not content:
+        return
+    
+    # Split content into tokens (words and punctuation)
+    import re
+    tokens = re.findall(r'\S+|\s+', content)
+    
+    accumulated_content = ""
+    
+    for i, token in enumerate(tokens):
+        accumulated_content += token
+        
+        try:
+            emit(event_name, {
+                'session_id': session_id,
+                'content': accumulated_content,
+                'is_complete': i == len(tokens) - 1,
+                'token': token,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            # Add small delay for realistic typing effect
+            time.sleep(delay)
+            
+        except Exception as e:
+            print(f"⚠️ Failed to emit token for {event_name}: {e}")
+            break

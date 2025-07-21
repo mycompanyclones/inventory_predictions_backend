@@ -23,15 +23,27 @@ except ImportError:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-here'
-CORS(app)
 
-# Initialize SocketIO with CORS  
+# Configure CORS for production deployment
+FRONTEND_URL = os.getenv('FRONTEND_URL', '*')
+ALLOWED_ORIGINS = [FRONTEND_URL] if FRONTEND_URL != '*' else '*'
+
+print(f"🔧 CORS configured for origins: {ALLOWED_ORIGINS}")
+
+CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
+
+# Initialize SocketIO with optimized configuration for EC2
 socketio = SocketIO(
     app, 
-    cors_allowed_origins=["http://localhost:3000", "http://127.0.0.1:3000"], 
+    cors_allowed_origins='*',
+    cors_credentials=True,
     async_mode='threading',
-    logger=True,
-    engineio_logger=True
+    logger=False,
+    engineio_logger=False,
+    ping_timeout=60,
+    ping_interval=25,
+    allow_upgrades=True,
+    max_http_buffer_size=1000000
 )
 
 # Redis connection for session management
@@ -162,6 +174,22 @@ def handle_messages(data):
         print(f"📨 Processing query [{session_id}]: {user_message[:100]}...")
         
         # Add user message to history
+        # Check if session is already processing
+        if hasattr(session_manager, 'is_processing') and session_manager.is_processing():
+            print(f"⚠️ Session {session_id} is already processing - rejecting new message")
+            socketio.emit('response', {
+                'type': 'error',
+                'content': 'Please wait for the current analysis to complete before sending a new message.',
+                'streaming_status': 'end',
+                'session_ready': False,
+                'timestamp': datetime.now().isoformat()
+            }, room=session_id)
+            return
+        
+        # Mark session as processing
+        if hasattr(session_manager, 'set_processing'):
+            session_manager.set_processing(True)
+        
         session_manager.add_message_to_history({"role": "user", "content": user_message})
         
         # Process the query using orchestrator (emits in real-time)
@@ -187,61 +215,66 @@ def handle_messages(data):
                 # Add assistant response to history
                 session_manager.add_message_to_history({"role": "assistant", "content": response_content})
                 
+                # CRITICAL: Reset processing state so session can handle new queries
+                if hasattr(session_manager, '_reset_processing_state'):
+                    session_manager._reset_processing_state()
+                
                 # Stream fallback response
                 emit('message', {
-                    'streaming_status': 'message_start',
-                    'session_id': session_id,
-                    'timestamp': datetime.now().isoformat()
+                    'type': 'text',
+                    'content': response_content,
+                    'timestamp': datetime.now().isoformat(),
+                    'sender': 'assistant',
+                    'streaming_status': 'complete'
                 })
                 
-                words = response_content.split(' ')
-                current_content = ''
-                for i, word in enumerate(words):
-                    current_content += word + ' '
-                    emit('message', {
-                        'streaming_status': 'message_continue',
-                        'text_response': current_content.strip(),
-                        'session_id': session_id,
+                # Send completion signal
+                emit('response', {
+                    'type': 'analysis_complete',
+                    'content': response_content,
+                    'metadata': {
+                        'tools_used': result.get('tools_used', []),
+                        'processing_time': result.get('processing_time', 0),
                         'timestamp': datetime.now().isoformat()
-                    })
-                    time.sleep(0.02)
-                
-                emit('message', {
+                    },
                     'streaming_status': 'end',
-                    'text_response': response_content,
-                    'session_id': session_id,
+                    'session_ready': True,
                     'timestamp': datetime.now().isoformat()
                 })
                 
-                emit('processing_complete', {
-                    'session_id': session_id,
-                    'success': True,
+                print("✅ Message processing completed")
+                
+        except Exception as e:
+            error_msg = f"An unexpected error occurred: {str(e)}"
+            print(f"❌ Error in handle_messages: {error_msg}")
+            print(f"📊 Traceback: {traceback.format_exc()}")
+            
+            # CRITICAL: Reset processing state on error
+            try:
+                if 'session_manager' in locals() and hasattr(session_manager, '_reset_processing_state'):
+                    session_manager._reset_processing_state()
+                
+                # Add error to session history
+                if 'session_manager' in locals():
+                    session_manager.add_message_to_history({"role": "assistant", "content": f"Error: {error_msg}"})
+                
+                # Emit error response
+                emit('response', {
+                    'type': 'error',
+                    'content': error_msg,
+                    'streaming_status': 'end',
+                    'session_ready': True,
                     'timestamp': datetime.now().isoformat()
                 })
-            
-        except Exception as e:
-            error_msg = f"Error processing query: {str(e)}"
-            print(f"❌ [ERROR] {error_msg}")
-            print(f"🔍 [TRACEBACK] {traceback.format_exc()}")
-            
-            # Add error to history
-            session_manager.add_message_to_history({"role": "assistant", "content": f"Error: {error_msg}"})
-            
-            # Emit error
-            emit('error', {
-                'session_id': session_id,
-                'error_type': 'processing_error',
-                'message': error_msg,
-                'timestamp': datetime.now().isoformat()
-            })
-            
-            # Emit processing complete with error
-            emit('processing_complete', {
-                'session_id': session_id,
-                'success': False,
-                'error': error_msg,
-                'timestamp': datetime.now().isoformat()
-            })
+            except Exception as cleanup_error:
+                print(f"❌ Error during cleanup: {cleanup_error}")
+                emit('response', {
+                    'type': 'error', 
+                    'content': 'System error occurred',
+                    'streaming_status': 'end',
+                    'session_ready': True,
+                    'timestamp': datetime.now().isoformat()
+                })
             
     except Exception as e:
         error_msg = f"Critical error in message handler: {str(e)}"
